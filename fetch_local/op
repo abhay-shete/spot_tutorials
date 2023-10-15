@@ -1,0 +1,11 @@
+2023-10-09 15:09:00.624 Python[13731:307979] ApplePersistenceIgnoreState: Existing state will not be touched. New state will be written to /var/folders/hd/8ct1rg6n3w71kzr3lkhz1ffh0000gn/T/org.python.python.savedState
+Username: Traceback (most recent call last):
+  File "fetch.py", line 572, in <module>
+    if not main(sys.argv[1:]):
+  File "fetch.py", line 235, in main
+    bosdyn.client.util.authenticate(robot)
+  File "/Users/abhay.shete/code/spot_robot_dog/.venv/lib/python3.8/site-packages/bosdyn/client/util.py", line 93, in authenticate
+    username, password = cli_login_prompt()
+  File "/Users/abhay.shete/code/spot_robot_dog/.venv/lib/python3.8/site-packages/bosdyn/client/util.py", line 36, in cli_login_prompt
+    username = input('')
+KeyboardInterrupt
