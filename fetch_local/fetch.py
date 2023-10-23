@@ -12,6 +12,7 @@ import cv2
 import math
 import bosdyn.client
 import bosdyn.client.util
+from scipy import ndimage
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.robot_command import RobotCommandClient, RobotCommandBuilder, block_until_arm_arrives
 from bosdyn.api import geometry_pb2
@@ -25,68 +26,17 @@ from bosdyn.api import manipulation_api_pb2
 from bosdyn.api import basic_command_pb2
 from bosdyn.client import frame_helpers
 from bosdyn.client import math_helpers
+from bosdyn.client.image import ImageClient
+from ultralytics import YOLO
+import object_detector as odapi
 
-import tensorflow as tf
-
-
-class TensorflowModel:
-    """ Wraps a tensorflow model in a way that allows online switching between models."""
-
-    def __init__(self, path, labels_path):
-        self.path = path
-
-        self.detection_graph = tf.Graph()
-        with self.detection_graph.as_default():
-            od_graph_def = tf.compat.v1.GraphDef()
-            with tf.io.gfile.GFile(self.path, 'rb') as fid:
-                serialized_graph = fid.read()
-                od_graph_def.ParseFromString(serialized_graph)
-                tf.import_graph_def(od_graph_def, name='')
-
-        # Make sure we tell tensor flow that this is a different model.
-        self.default_graph = self.detection_graph.as_default()
-        self.sess = tf.compat.v1.Session(graph=self.detection_graph)
-
-        # Definite input and output Tensors for detection_graph
-        self.image_tensor = self.detection_graph.get_tensor_by_name('image_tensor:0')
-        # Each box represents a part of the image where a particular object was detected.
-        self.detection_boxes = self.detection_graph.get_tensor_by_name('detection_boxes:0')
-        # Each score represent how level of confidence for each of the objects.
-        # Score is shown on the result image, together with the class label.
-        self.detection_scores = self.detection_graph.get_tensor_by_name('detection_scores:0')
-        self.detection_classes = self.detection_graph.get_tensor_by_name('detection_classes:0')
-        self.num_detections = self.detection_graph.get_tensor_by_name('num_detections:0')
-
-        if labels_path is None:
-            self.labels = None
-        else:
-            # Load the class label mappings
-            self.labels = open(labels_path).read().strip().split('\n')
-            self.labels = {int(L.split(',')[1]): L.split(',')[0] for L in self.labels}
-
-    def predict(self, image):
-        """ Predict with this model. """
-        with self.detection_graph.as_default():
-            # Expand dimensions since the trained_model expects images to have shape: [1, None, None, 3]
-            image_np_expanded = np.expand_dims(image, axis=0)
-            # Actual detection.
-            (boxes, scores, classes, num) = self.sess.run([
-                self.detection_boxes, self.detection_scores, self.detection_classes,
-                self.num_detections
-            ], feed_dict={self.image_tensor: image_np_expanded})
-
-            im_height, im_width, _ = image.shape
-            boxes_list = [None for i in range(boxes.shape[1])]
-            for i in range(boxes.shape[1]):
-                boxes_list[i] = (int(boxes[0, i, 0] * im_height), int(boxes[0, i, 1] * im_width),
-                                 int(boxes[0, i, 2] * im_height), int(boxes[0, i, 3] * im_width))
-
-            if self.labels is not None:
-                labels_out = [self.labels[int(x)] for x in classes[0].tolist()]
-            else:
-                labels_out = classes[0].tolist()
-
-            return boxes_list, scores[0].tolist(), labels_out, int(num[0])
+ROTATION_ANGLES = {
+    'back_fisheye_image': 0,
+    'frontleft_fisheye_image': -78,
+    'frontright_fisheye_image': -102,
+    'left_fisheye_image': 0,
+    'right_fisheye_image': 180
+}
 
 
 kImageSources = [
@@ -94,19 +44,25 @@ kImageSources = [
     'left_fisheye_image', 'right_fisheye_image', 'back_fisheye_image'
 ]
 
-def get_obj_and_img(network_compute_client, service, model, confidence,
+
+def get_obj_and_img(image_client, model, confidence,
                     image_sources, label):
 
     for source in image_sources:
         # Build a network compute request for this image source.
-        image_source_and_service = network_compute_bridge_pb2.ImageSourceAndService(
-            image_source=source)
+        image_source_and_service_resp = image_client.get_image_from_sources([source])
 
-        img = np.frombuffer(image_source_and_service[0].shot.image.data, dtype=np.uint8)
+        dtype = np.uint8
+        img = np.frombuffer(image_source_and_service_resp[0].shot.image.data, dtype=dtype)
         img = cv2.imdecode(img, -1)
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
-        boxes, scores, classes, _ = model.predict(image)
-        best_obj = None
+        img = ndimage.rotate(img, ROTATION_ANGLES[source])
+
+        frame_name = image_source_and_service_resp[0].shot.frame_name_image_sensor
+
+        boxes, scores, classes = odapi.predict(img, model)
+        best_bbox = None
         highest_conf = 0.0
         best_vision_tform_obj = None
 
@@ -114,34 +70,37 @@ def get_obj_and_img(network_compute_client, service, model, confidence,
         cv2.imshow("Fetch", img)
         cv2.waitKey(15)
 
-        if len(resp.object_in_image) > 0:
-            for obj in resp.object_in_image:
-                # Get the label
-                obj_label = obj.name.split('_label_')[-1]
-                if obj_label != label:
-                    continue
-                conf_msg = wrappers_pb2.FloatValue()
-                obj.additional_properties.Unpack(conf_msg)
-                conf = conf_msg.value
+        for box, score, cls in zip(boxes, scores, classes):
+            # Get the label
+            obj_label = model.model.names[cls]
+            print("Object label={}, score={}".format(obj_label, score))
 
-                try:
-                    vision_tform_obj = frame_helpers.get_a_tform_b(
-                        obj.transforms_snapshot,
-                        frame_helpers.VISION_FRAME_NAME,
-                        obj.image_properties.frame_name_image_coordinates)
-                except bosdyn.client.frame_helpers.ValidateFrameTreeError:
-                    # No depth data available.
-                    vision_tform_obj = None
+            if obj_label != label:
+                continue
 
-                if conf > highest_conf and vision_tform_obj is not None:
-                    highest_conf = conf
-                    best_obj = obj
-                    best_vision_tform_obj = vision_tform_obj
+            conf = score
 
-        if best_obj is not None:
-            return best_obj, image_full, best_vision_tform_obj
+            try:
+                vision_tform_obj = frame_helpers.get_a_tform_b(
+                    image_source_and_service_resp[0].shot.transforms_snapshot,
+                    frame_helpers.VISION_FRAME_NAME,
+                    frame_name)
+                    #obj.image_properties.frame_name_image_coordinates)
+            except bosdyn.client.frame_helpers.ValidateFrameTreeError:
+                # No depth data available.
+                print("Depth information not available in the frame tree")
+                vision_tform_obj = None
+
+            if conf > highest_conf and vision_tform_obj is not None:
+                highest_conf = conf
+                best_bbox = box
+                best_vision_tform_obj = vision_tform_obj
+
+        if best_bbox is not None:
+            return best_bbox, image_source_and_service_resp[0], best_vision_tform_obj
 
     return None, None, None
+
 
 def get_bounding_box_image(response):
     dtype = np.uint8
@@ -179,6 +138,7 @@ def get_bounding_box_image(response):
 
     return img
 
+
 def find_center_px(polygon):
     min_x = math.inf
     min_y = math.inf
@@ -196,6 +156,7 @@ def find_center_px(polygon):
     x = math.fabs(max_x - min_x) / 2.0 + min_x
     y = math.fabs(max_y - min_y) / 2.0 + min_y
     return (x, y)
+
 
 def block_for_trajectory_cmd(command_client, cmd_id, timeout_sec=None, verbose=False):
     """Helper that blocks until a trajectory command reaches STATUS_AT_GOAL or a timeout is
@@ -290,23 +251,19 @@ def main(argv):
     lease_client.take()
     print("Acquired lease...about to play fetch....")
 
-    tf_model = TensorflowModel(options.model_path)
+    od_model = YOLO("yolov8l")
 
     with bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
         # Store the position of the hand at the last toy drop point.
         vision_tform_hand_at_drop = None
-
+        image_client = robot.ensure_client(ImageClient.default_service_name)
         while True:
             holding_toy = False
             while not holding_toy:
                 # Capture an image and run ML on it.
-                dogtoy, image, vision_tform_dogtoy = get_obj_and_img(
-                    network_compute_client, options.ml_service, tf_model,
-                    options.confidence_dogtoy, kImageSources, 'dogtoy')
-
-                if dogtoy is None:
-                    # Didn't find anything, keep searching.
-                    continue
+                bbox, image, vision_tform_dogtoy = get_obj_and_img(
+                    image_client, od_model,
+                    options.confidence_dogtoy, kImageSources, 'sports_ball')
 
                 # If we have already dropped the toy off, make sure it has moved a sufficient amount before
                 # picking it up again
@@ -343,8 +300,13 @@ def main(argv):
                 block_for_trajectory_cmd(command_client, cmd_id, timeout_sec=5, verbose=True)
 
                 # The ML result is a bounding box.  Find the center.
+                """
                 (center_px_x,
                  center_px_y) = find_center_px(dogtoy.image_properties.coordinates)
+                """
+                center_px_x = (bbox[0] + bbox[2])/2
+                center_px_y = (bbox[1] + bbox[3])/2
+
 
                 # Request Pick Up on that pixel.
                 pick_vec = geometry_pb2.Vec2(x=center_px_x, y=center_px_y)
@@ -438,8 +400,7 @@ def main(argv):
             while person is None:
                 # Find a person to deliver the toy to
                 person, image, vision_tform_person = get_obj_and_img(
-                    network_compute_client, options.ml_service,
-                    options.person_model, options.confidence_person, kImageSources,
+                    image_client, options.person_model, options.confidence_person, kImageSources,
                     'person')
 
             # We now have found a person to drop the toy off near.
